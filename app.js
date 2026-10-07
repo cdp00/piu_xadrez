@@ -2,6 +2,9 @@
   'use strict';
 
   const STORAGE_KEY = 'piu-xadrez-progresso-v1';
+  const ACCOUNTS_KEY = 'piu-xadrez-contas-v1';
+  const SESSION_KEY = 'piu-xadrez-sessao-v1';
+  const PASSWORD_ITERATIONS = 120000;
   const PIECE_GLYPHS = { K: '♔', Q: '♕', R: '♖', B: '♗', N: '♘', P: '♙', k: '♚', q: '♛', r: '♜', b: '♝', n: '♞', p: '♟' };
   const PIECE_NAMES = { K: 'rei', Q: 'dama', R: 'torre', B: 'bispo', N: 'cavalo', P: 'peão' };
   const FILES = 'abcdefgh';
@@ -78,10 +81,13 @@
     return `${y}-${m}-${d}`;
   }
   function yesterdayString() { const d = new Date(); d.setDate(d.getDate() - 1); return todayString(d); }
-  function freshProgress() { return { xp: 0, completed: [], streak: 0, lastActive: '', solvedChallenges: [], bossWins: 0, playerName: 'Estrategista', avatar: 'piu', magnusUnlocked: false }; }
-  function readProgress() {
+  function normalizeUsername(value) { return String(value || '').trim(); }
+  function isValidUsername(value) { return /^[A-Za-z0-9_.-]{3,20}$/.test(value); }
+  function accountProgressKey(username) { return `${STORAGE_KEY}:aluno:${encodeURIComponent(username.toLowerCase())}`; }
+  function freshProgress(playerName='Estrategista') { return { xp: 0, completed: [], streak: 0, lastActive: '', solvedChallenges: [], bossWins: 0, bossGames: 0, bossLosses: 0, bossDraws: 0, playerName, avatar: 'piu', magnusUnlocked: false }; }
+  function readProgress(storageKey=STORAGE_KEY) {
     try {
-      const parsed = JSON.parse(localStorage.getItem(STORAGE_KEY) || 'null');
+      const parsed = JSON.parse(localStorage.getItem(storageKey) || 'null');
       if (!parsed || typeof parsed !== 'object') return freshProgress();
       const magnusUnlocked = parsed.magnusUnlocked === true;
       const avatar = PROFILE_BIRDS.some(option => option.id === parsed.avatar) || (parsed.avatar === 'magnus' && magnusUnlocked) ? parsed.avatar : 'piu';
@@ -92,15 +98,20 @@
         lastActive: typeof parsed.lastActive === 'string' ? parsed.lastActive : '',
         solvedChallenges: Array.isArray(parsed.solvedChallenges) ? [...new Set(parsed.solvedChallenges.filter(n => Number.isInteger(n) && n >= 0 && n < challenges.length))] : [],
         bossWins: Number.isInteger(parsed.bossWins) && parsed.bossWins >= 0 ? parsed.bossWins : 0,
+        bossGames: Number.isInteger(parsed.bossGames) && parsed.bossGames >= 0 ? parsed.bossGames : 0,
+        bossLosses: Number.isInteger(parsed.bossLosses) && parsed.bossLosses >= 0 ? parsed.bossLosses : 0,
+        bossDraws: Number.isInteger(parsed.bossDraws) && parsed.bossDraws >= 0 ? parsed.bossDraws : 0,
         playerName: normalizePlayerName(parsed.playerName) || 'Estrategista',
         avatar,
         magnusUnlocked
       };
     } catch (error) { return freshProgress(); }
   }
-  const progress = readProgress();
+  let currentUser = null;
+  let progress = freshProgress();
   function persist() {
-    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(progress)); }
+    if(!currentUser) return;
+    try { localStorage.setItem(accountProgressKey(currentUser.username), JSON.stringify(progress)); }
     catch (error) { /* The lessons remain playable when storage is unavailable. */ }
   }
   function updateDailyStreak() {
@@ -110,9 +121,91 @@
     progress.lastActive = today;
     persist();
   }
-  updateDailyStreak();
-
-  const ui = { page: 'home', lessonIndex: 0, lessonAnswers: {}, challengeIndex: 0, mode: 'puzzle', toast: '', toastTimer: null, profileTab: 'birds' };
+  function readAccounts() {
+    try {
+      const parsed=JSON.parse(localStorage.getItem(ACCOUNTS_KEY) || '[]');
+      if(!Array.isArray(parsed)) return [];
+      return parsed.filter(account=>account && typeof account.username==='string' && isValidUsername(account.username) && typeof account.salt==='string' && /^[a-f0-9]{32}$/i.test(account.salt) && typeof account.hash==='string' && /^[a-f0-9]{64}$/i.test(account.hash))
+        .map(account=>({ username:normalizeUsername(account.username), salt:account.salt.toLowerCase(), hash:account.hash.toLowerCase() }));
+    } catch (error) { return []; }
+  }
+  function bytesToHex(bytes) { return Array.from(bytes, value=>value.toString(16).padStart(2,'0')).join(''); }
+  function hexToBytes(hex) { return Uint8Array.from(hex.match(/.{2}/g) || [], byte=>parseInt(byte,16)); }
+  function createSalt() {
+    if(!window.crypto?.getRandomValues) throw new Error('crypto-unavailable');
+    const salt=new Uint8Array(16); window.crypto.getRandomValues(salt); return bytesToHex(salt);
+  }
+  async function hashPassword(password,saltHex) {
+    if(!window.crypto?.subtle || typeof TextEncoder==='undefined') throw new Error('crypto-unavailable');
+    const material=await window.crypto.subtle.importKey('raw',new TextEncoder().encode(password),'PBKDF2',false,['deriveBits']);
+    const bits=await window.crypto.subtle.deriveBits({name:'PBKDF2',salt:hexToBytes(saltHex),iterations:PASSWORD_ITERATIONS,hash:'SHA-256'},material,256);
+    return bytesToHex(new Uint8Array(bits));
+  }
+  function hashesMatch(left,right) {
+    if(typeof left!=='string' || typeof right!=='string' || left.length!==right.length) return false;
+    let difference=0;
+    for(let i=0;i<left.length;i++) difference|=left.charCodeAt(i)^right.charCodeAt(i);
+    return difference===0;
+  }
+  function saveSession(username) { localStorage.setItem(SESSION_KEY,JSON.stringify({username:username.toLowerCase()})); }
+  function restoreSession() {
+    try {
+      const session=JSON.parse(localStorage.getItem(SESSION_KEY) || 'null');
+      if(!session || typeof session.username!=='string') return;
+      const account=readAccounts().find(entry=>entry.username.toLowerCase()===session.username.toLowerCase());
+      if(!account) { localStorage.removeItem(SESSION_KEY); return; }
+      currentUser=account;
+      progress=readProgress(accountProgressKey(account.username));
+      if(progress.playerName==='Estrategista') progress.playerName=account.username;
+      updateDailyStreak();
+    } catch (error) { currentUser=null; progress=freshProgress(); }
+  }
+  function authMessage(message,isError=true) { ui.authMessage=message; ui.authError=isError; render(); }
+  async function submitAuthForm(form) {
+    const mode=form.dataset.authForm;
+    const username=normalizeUsername(form.elements.username.value);
+    const password=String(form.elements.password.value || '');
+    if(!isValidUsername(username)) { authMessage('Use de 3 a 20 caracteres: letras sem acento, números, ponto, hífen ou _.'); return; }
+    if(password.length<8) { authMessage('A senha precisa ter pelo menos 8 caracteres.'); return; }
+    if(password.length>128) { authMessage('A senha pode ter no máximo 128 caracteres.'); return; }
+    try {
+      if(mode==='register') {
+        const confirmation=String(form.elements.confirmPassword.value || '');
+        if(password!==confirmation) { authMessage('As senhas não são iguais. Confira e tente novamente.'); return; }
+        const accounts=readAccounts();
+        if(accounts.some(account=>account.username.toLowerCase()===username.toLowerCase())) { authMessage('Esse nome já está em uso. Escolha outro.'); return; }
+        const salt=createSalt();
+        const account={username,salt,hash:await hashPassword(password,salt)};
+        let initialProgress=freshProgress(username);
+        const legacyData=accounts.length===0?localStorage.getItem(STORAGE_KEY):null;
+        if(legacyData) {
+          initialProgress=readProgress(STORAGE_KEY);
+          if(initialProgress.playerName==='Estrategista') initialProgress.playerName=username;
+        }
+        localStorage.setItem(ACCOUNTS_KEY,JSON.stringify([...accounts,account]));
+        currentUser=account; progress=initialProgress; saveSession(username); persist();
+        if(legacyData) localStorage.removeItem(STORAGE_KEY);
+      } else {
+        const account=readAccounts().find(entry=>entry.username.toLowerCase()===username.toLowerCase());
+        if(!account) { authMessage('Usuário ou senha incorretos.'); return; }
+        const candidate=await hashPassword(password,account.salt);
+        if(!hashesMatch(candidate,account.hash)) { authMessage('Usuário ou senha incorretos.'); return; }
+        currentUser=account;
+        progress=readProgress(accountProgressKey(account.username));
+        if(progress.playerName==='Estrategista') progress.playerName=account.username;
+        saveSession(account.username);
+      }
+      updateDailyStreak(); ui.page='home'; ui.authMessage=''; ui.authError=false; ui.toast=''; render();
+    } catch (error) {
+      authMessage('Não foi possível criar ou abrir a conta. Use GitHub Pages, localhost ou um navegador atualizado.');
+    }
+  }
+  function logout() {
+    try { localStorage.removeItem(SESSION_KEY); } catch (error) { /* A sessão também é encerrada nesta página. */ }
+    currentUser=null; progress=freshProgress(); ui.page='home'; ui.authMode='login'; ui.authMessage='Você saiu da conta.'; ui.authError=false; ui.toast='';
+    game=fromFen(challenges[0].fen); render();
+  }
+  const ui = { page: 'home', lessonIndex: 0, lessonAnswers: {}, challengeIndex: 0, mode: 'puzzle', toast: '', toastTimer: null, profileTab: 'birds', authMode: 'login', authMessage: '', authError: false };
   let game = fromFen(challenges[0].fen);
   const app = document.getElementById('app');
 
@@ -289,8 +382,12 @@
     if (ui.page==='lesson') return lessons[ui.lessonIndex].title;
     return ({ home:'Início', path:'Trilha de aulas', practice:'Praticar', profile:'Meu perfil' })[ui.page] || 'Piu Xadrez';
   }
+  function authView() {
+    const creating=ui.authMode==='register';
+    return `<main class="auth-screen"><div class="auth-brand"><span class="brand-mark" aria-hidden="true">♞</span><span>Piu Xadrez</span></div><section class="card auth-card" aria-labelledby="auth-title"><div class="auth-mascot">${mascotBird()}</div><p class="eyebrow">Seu cantinho de xadrez</p><h1 id="auth-title">${creating?'Crie sua conta':'Entre para aprender'}</h1><p class="auth-intro">${creating?'Escolha um nome de usuário e uma senha. Não precisa de e-mail.':'Entre para continuar de onde parou.'}</p><form class="auth-form" data-auth-form="${creating?'register':'login'}"><label for="auth-username">Nome de usuário</label><input id="auth-username" name="username" type="text" minlength="3" maxlength="20" pattern="[A-Za-z0-9_.-]{3,20}" autocomplete="username" required placeholder="Ex.: Ana_Chess"><label for="auth-password">Senha</label><input id="auth-password" name="password" type="password" minlength="8" maxlength="128" autocomplete="${creating?'new-password':'current-password'}" required placeholder="Pelo menos 8 caracteres">${creating?'<label for="auth-confirm-password">Confirme a senha</label><input id="auth-confirm-password" name="confirmPassword" type="password" minlength="8" maxlength="128" autocomplete="new-password" required placeholder="Digite a senha novamente">':''}<small class="auth-hint">${creating?'Use de 3 a 20 caracteres no usuário. Sua conta e seu progresso ficam salvos neste navegador.':'Seu progresso é carregado automaticamente ao entrar.'}</small><button type="submit" class="button button-primary auth-submit">${creating?'Criar conta':'Entrar'} <span aria-hidden="true">→</span></button></form>${ui.authMessage?`<p class="auth-message ${ui.authError?'error':''}" role="status">${escapeHtml(ui.authMessage)}</p>`:''}<button type="button" class="auth-switch" data-action="auth-mode">${creating?'Já tem conta? Entrar':'Primeira vez aqui? Criar conta'}</button></section><p class="auth-footnote">Sem e-mail. As contas são locais a este navegador.</p></main>`;
+  }
   function headerMarkup() {
-    return `<header class="topbar"><div class="breadcrumb">Piu Xadrez <span aria-hidden="true">›</span> <strong>${pageTitle()}</strong></div><div class="top-profile"><div class="top-xp"><span aria-hidden="true">✦</span> ${progress.xp} XP</div>${avatarVisual(progress.avatar,'avatar')}<span class="player-name">${escapeHtml(progress.playerName)}</span></div></header>`;
+    return `<header class="topbar"><div class="breadcrumb">Piu Xadrez <span aria-hidden="true">›</span> <strong>${pageTitle()}</strong></div><div class="top-profile"><div class="top-xp"><span aria-hidden="true">✦</span> ${progress.xp} XP</div>${avatarVisual(progress.avatar,'avatar')}<span class="player-name">${escapeHtml(currentUser.username)}</span><button type="button" class="button button-outline button-small logout-button" data-action="logout">Sair</button></div></header>`;
   }
   function shell(content) {
     return `<div class="layout"><aside class="sidebar"><div class="brand"><span class="brand-mark" aria-hidden="true">♞</span><span>Piu Xadrez</span></div><div class="nav-label">Aprender</div>${navMarkup()}<div class="sidebar-spacer"></div><div class="side-streak"><span class="flame" aria-hidden="true">🔥</span><strong>${progress.streak} ${progress.streak===1?'dia':'dias'} de sequência</strong><p>Uma aula por dia e logo você vira mestre do tabuleiro.</p></div><div class="sidebar-footer">Feito para aprender, lance a lance.</div></aside><div class="main-column">${headerMarkup()}<main class="page-content">${content}</main></div>${navMarkup('mobile-nav')}${ui.toast?`<div class="toast" role="status">${ui.toast}</div>`:''}</div>`;
@@ -299,7 +396,7 @@
   function homeView() {
     const bossUnlocked=progress.completed.length>=lessons.length;
     const next=nextLessonIndex(), lesson=lessons[next], first=!progress.completed.length;
-    return `<section aria-labelledby="welcome-title"><div class="hero-card"><div class="hero-copy"><p class="eyebrow">Seu cantinho de xadrez</p><h1 id="welcome-title">${first?`Vamos jogar, ${escapeHtml(progress.playerName)}?`:'Que bom ter você de volta!'}</h1><p>Aprenda xadrez jogando! A cada lance, uma nova descoberta.</p><div class="hero-actions"><button type="button" class="button button-primary" data-action="start">${first?'COMEÇAR':bossUnlocked?'JOGAR CONTRA O PIU':'CONTINUAR APRENDENDO'} <span aria-hidden="true">→</span></button><button type="button" class="button button-soft" data-page="path">Ver a trilha</button></div></div><div class="hero-art">${mascotBird()}<div class="mascot-caption">Oi! Eu sou o Piu 👋</div></div></div>
+    return `<section aria-labelledby="welcome-title"><div class="hero-card"><div class="hero-copy"><p class="eyebrow">Seu cantinho de xadrez</p><h1 id="welcome-title">Olá, ${escapeHtml(currentUser.username)}!</h1><p>${first?'Aprenda xadrez jogando! A cada lance, uma nova descoberta.':'Que bom ter você de volta! Continue aprendendo a cada lance.'}</p><div class="hero-actions"><button type="button" class="button button-primary" data-action="start">${first?'COMEÇAR':bossUnlocked?'JOGAR CONTRA O PIU':'CONTINUAR APRENDENDO'} <span aria-hidden="true">→</span></button><button type="button" class="button button-soft" data-page="path">Ver a trilha</button></div></div><div class="hero-art">${mascotBird()}<div class="mascot-caption">Oi! Eu sou o Piu 👋</div></div></div>
       <div class="stats-grid"><article class="stat-card"><div class="stat-top"><span>Nível atual</span><span class="stat-icon">🏅</span></div><div class="stat-number">${currentLevel()} <small>de ${totalLevelCount()}</small></div></article><article class="stat-card"><div class="stat-top"><span>Experiência</span><span class="stat-icon">✦</span></div><div class="stat-number">${progress.xp} <small>XP</small></div></article><article class="stat-card"><div class="stat-top"><span>Sequência</span><span class="stat-icon">🔥</span></div><div class="stat-number">${progress.streak} <small>${progress.streak===1?'dia':'dias'}</small></div></article></div>
       <div class="section-heading"><h2>Sua próxima jogada</h2><button type="button" class="text-button" data-page="path">Ver todas as aulas →</button></div>
       <div class="home-grid"><article class="card continue-card"><div class="continue-copy"><span class="lesson-pill">${bossUnlocked?'NÍVEL BOSS':'AULA '+(next+1)+' · '+lesson.time}</span><h3>${bossUnlocked?'Desafie o Piu':lesson.title}</h3><p>${bossUnlocked?'Você chegou ao final da trilha. Agora é sua vez de jogar contra o Piu!':'Uma nova etapa para aprender no seu ritmo.'}</p><div class="mini-progress" aria-label="${percentComplete()}% das aulas concluídas"><span style="width:${percentComplete()}%"></span></div></div><button type="button" class="button button-green" data-action="${bossUnlocked?'boss':'continue'}">${bossUnlocked?'JOGAR':'CONTINUAR'} <span aria-hidden="true">→</span></button></article><article class="card bird-tip">${mascotBird()}<div><strong>Piu te lembra</strong><p>“Cada grande jogador começou aprendendo um lance. Vamos nessa!”</p></div></article></div>
@@ -390,7 +487,7 @@
     const avatarChoices = avatarOptions.map(option=>`<button type="button" class="avatar-choice ${progress.avatar===option.id?'selected':''}" data-avatar="${option.id}" aria-pressed="${progress.avatar===option.id}" aria-label="Usar avatar ${option.name}">${option.isPhoto?`<img src="${MAGNUS_PHOTO}" alt="" loading="lazy" referrerpolicy="no-referrer">`:`<span aria-hidden="true">${option.emoji}</span>`}<strong>${option.name}</strong>${progress.avatar===option.id?'<span class="avatar-selected-mark" aria-label="Selecionado">✓</span>':''}</button>`).join('');
     const birdPanel = `<div class="profile-tab-panel" role="tabpanel" id="profile-birds-panel" ${ui.profileTab==='birds'?'':'hidden'}><p>Escolha uma ave para aparecer no seu perfil.</p><div class="avatar-options">${avatarChoices}</div>${progress.magnusUnlocked?`<p class="photo-credit">Foto: <a href="${MAGNUS_SOURCE}" target="_blank" rel="noreferrer">Stefan64 / Wikimedia Commons</a> · <a href="${MAGNUS_LICENSE}" target="_blank" rel="noreferrer">CC BY-SA 3.0</a>.</p>`:''}</div>`;
     const codePanel = `<div class="profile-tab-panel" role="tabpanel" id="profile-code-panel" ${ui.profileTab==='code'?'':'hidden'}><p>Tem um código especial? Digite aqui para liberar um avatar surpresa.</p><form class="unlock-code-form" data-profile-form="unlock-magnus"><label for="unlock-code">Código secreto</label><div class="profile-form-row"><input id="unlock-code" name="code" type="password" inputmode="numeric" autocomplete="off" maxlength="8" placeholder="Digite o código" aria-describedby="unlock-code-hint"><button type="submit" class="button button-green">Desbloquear</button></div><small id="unlock-code-hint">O código libera uma foto especial de perfil.</small></form>${progress.magnusUnlocked?'<div class="unlock-success" role="status">✓ Foto especial desbloqueada! Encontre-a na aba Aves.</div>':''}</div>`;
-    return `<section aria-labelledby="profile-title"><p class="eyebrow">Seu caminho até aqui</p><h1 id="profile-title">Meu perfil</h1><p class="subheading">Cada partida e cada aula fazem parte da sua evolução.</p><article class="card profile-hero">${avatarVisual(progress.avatar,'profile-avatar')}<div><h2>${escapeHtml(progress.playerName)}</h2><p>Aprendiz de xadrez · Nível ${currentAccountLevel()}</p></div><div class="profile-xp"><strong>${progress.xp} XP</strong><span>${progress.xp%100}/100 para o próximo nível</span></div></article><article class="card profile-editor"><h2>Personalize seu perfil</h2><form class="profile-name-form" data-profile-form="player-name"><label for="player-name">Seu nome</label><div class="profile-form-row"><input id="player-name" name="playerName" type="text" maxlength="24" value="${escapeHtml(progress.playerName)}" autocomplete="nickname" placeholder="Como quer ser chamado?"><button type="submit" class="button button-green">Salvar nome</button></div></form><div class="profile-tabs" role="tablist" aria-label="Opções da foto de perfil"><button type="button" class="profile-tab ${ui.profileTab==='birds'?'active':''}" data-profile-tab="birds" role="tab" aria-selected="${ui.profileTab==='birds'}" aria-controls="profile-birds-panel">Aves</button><button type="button" class="profile-tab ${ui.profileTab==='code'?'active':''}" data-profile-tab="code" role="tab" aria-selected="${ui.profileTab==='code'}" aria-controls="profile-code-panel">Código secreto</button></div>${birdPanel}${codePanel}</article><div class="profile-grid"><article class="card profile-stat"><div class="stat-top">Nível da trilha<span>📖</span></div><div class="stat-number">${currentLevel()} <small>de ${totalLevelCount()}</small></div></article><article class="card profile-stat"><div class="stat-top">Aulas concluídas<span>✅</span></div><div class="stat-number">${progress.completed.length} <small>de ${lessons.length}</small></div></article><article class="card profile-stat"><div class="stat-top">Sequência atual<span>🔥</span></div><div class="stat-number">${progress.streak} <small>${progress.streak===1?'dia':'dias'}</small></div></article></div><div class="section-heading"><h2>Conquistas</h2><span class="text-button" style="cursor:default">${unlocked} de ${achievements.length} desbloqueadas</span></div><div class="achievement-grid">${achievements.map(a=>`<article class="achievement ${a.test(progress)?'':'locked'}"><div class="achievement-icon" aria-hidden="true">${a.icon}</div><div><strong>${a.name}</strong><span>${a.desc}</span></div></article>`).join('')}</div><div class="section-heading"><h2>Progresso da trilha</h2></div><article class="card" style="padding:18px 20px;margin-bottom:16px"><div class="path-progress-meta"><span>${progress.completed.length} aulas concluídas · ${progress.bossWins} vitórias contra o Piu</span><span>${percentComplete()}%</span></div><div class="progress-track"><span style="width:${percentComplete()}%"></span></div></article><article class="card settings-card"><div><h3>Dados neste navegador</h3><p>Seu XP, aulas e sequência ficam salvos neste dispositivo.</p></div><button type="button" class="button button-outline button-small" data-action="reset-progress">Zerar progresso</button></article></section>`;
+    return `<section aria-labelledby="profile-title"><p class="eyebrow">Seu caminho até aqui</p><h1 id="profile-title">Meu perfil</h1><p class="subheading">Cada partida e cada aula fazem parte da sua evolução.</p><article class="card profile-hero">${avatarVisual(progress.avatar,'profile-avatar')}<div><h2>${escapeHtml(progress.playerName)}</h2><p>Aprendiz de xadrez · Nível ${currentAccountLevel()}</p></div><div class="profile-xp"><strong>${progress.xp} XP</strong><span>${progress.xp%100}/100 para o próximo nível</span></div></article><article class="card profile-editor"><h2>Personalize seu perfil</h2><form class="profile-name-form" data-profile-form="player-name"><label for="player-name">Seu nome</label><div class="profile-form-row"><input id="player-name" name="playerName" type="text" maxlength="24" value="${escapeHtml(progress.playerName)}" autocomplete="nickname" placeholder="Como quer ser chamado?"><button type="submit" class="button button-green">Salvar nome</button></div></form><div class="profile-tabs" role="tablist" aria-label="Opções da foto de perfil"><button type="button" class="profile-tab ${ui.profileTab==='birds'?'active':''}" data-profile-tab="birds" role="tab" aria-selected="${ui.profileTab==='birds'}" aria-controls="profile-birds-panel">Aves</button><button type="button" class="profile-tab ${ui.profileTab==='code'?'active':''}" data-profile-tab="code" role="tab" aria-selected="${ui.profileTab==='code'}" aria-controls="profile-code-panel">Código secreto</button></div>${birdPanel}${codePanel}</article><div class="profile-grid"><article class="card profile-stat"><div class="stat-top">Nível da trilha<span>📖</span></div><div class="stat-number">${currentLevel()} <small>de ${totalLevelCount()}</small></div></article><article class="card profile-stat"><div class="stat-top">Aulas concluídas<span>✅</span></div><div class="stat-number">${progress.completed.length} <small>de ${lessons.length}</small></div></article><article class="card profile-stat"><div class="stat-top">Sequência atual<span>🔥</span></div><div class="stat-number">${progress.streak} <small>${progress.streak===1?'dia':'dias'}</small></div></article><article class="card profile-stat"><div class="stat-top">Partidas contra o Piu<span>♟</span></div><div class="stat-number">${progress.bossGames} <small>jogadas</small></div></article></div><div class="section-heading"><h2>Conquistas</h2><span class="text-button" style="cursor:default">${unlocked} de ${achievements.length} desbloqueadas</span></div><div class="achievement-grid">${achievements.map(a=>`<article class="achievement ${a.test(progress)?'':'locked'}"><div class="achievement-icon" aria-hidden="true">${a.icon}</div><div><strong>${a.name}</strong><span>${a.desc}</span></div></article>`).join('')}</div><div class="section-heading"><h2>Progresso da trilha</h2></div><article class="card" style="padding:18px 20px;margin-bottom:16px"><div class="path-progress-meta"><span>${progress.completed.length} aulas concluídas · ${progress.bossWins} vitórias · ${progress.bossLosses} derrotas · ${progress.bossDraws} empates contra o Piu</span><span>${percentComplete()}%</span></div><div class="progress-track"><span style="width:${percentComplete()}%"></span></div></article><article class="card settings-card"><div><h3>Dados neste navegador</h3><p>Seu XP, aulas e sequência ficam salvos neste dispositivo.</p></div><button type="button" class="button button-outline button-small" data-action="reset-progress">Zerar progresso</button></article></section>`;
   }
 
   function submitProfileForm(form) {
@@ -413,6 +510,7 @@
   }
 
   function render() {
+    if(!currentUser) { app.innerHTML=authView(); return; }
     let content='';
     if(ui.page==='home') content=homeView();
     else if(ui.page==='path') content=pathView();
@@ -460,7 +558,7 @@
   }
   function startBoss() {
     if (progress.completed.length<lessons.length) { showToast('Conclua as aulas difíceis para desbloquear o Boss.'); return; }
-    ui.mode='boss'; ui.page='practice'; game=createInitialGame(); render();
+    ui.mode='boss'; ui.page='practice'; progress.bossGames+=1; persist(); game=createInitialGame(); render();
   }
   function updateGameMessage(message,error=false) { game.message=message; game.error=error; }
   function materialScore(g,color='b') {
@@ -536,11 +634,11 @@
     else if(ui.mode==='boss') {
       const piuMoved=moving.color==='b';
       next.aiThinking=false;
-      if(mate && piuMoved) next.message='Xeque-mate! Piu venceu. Quer tentar de novo?';
+      if(mate && piuMoved) { if(!game.bossResultRecorded) { progress.bossLosses+=1; persist(); next.bossResultRecorded=true; } next.message='Xeque-mate! Piu venceu. Quer tentar de novo?'; }
       else if(mate) {
         next.message='Xeque-mate! Você venceu o Piu! +50 XP';
-        if(!game.bossRewarded) { progress.bossWins+=1; progress.xp+=50; next.bossRewarded=true; persist(); bossWinMessage='Você venceu o Piu! +50 XP ✦'; }
-      } else if(stalemate) next.message='Empate por afogamento. Boa partida!';
+        if(!game.bossRewarded) { progress.bossWins+=1; progress.xp+=50; next.bossRewarded=true; next.bossResultRecorded=true; persist(); bossWinMessage='Você venceu o Piu! +50 XP ✦'; }
+      } else if(stalemate) { if(!game.bossResultRecorded) { progress.bossDraws+=1; persist(); next.bossResultRecorded=true; } next.message='Empate por afogamento. Boa partida!'; }
       else if(piuMoved) next.message=check?'Xeque! Piu está pressionando.':'Sua vez, estrategista!';
       else { next.message=check?'Xeque! Piu está pensando em como responder…':'Piu está pensando…'; next.aiThinking=true; }
     } else next.message=mate?'Xeque-mate!':check?'Xeque! Boa jogada!':stalemate?'Empate por afogamento.':`${turnColor==='w'?'Brancas':'Pretas'} jogam. Boa jogada!`;
@@ -590,6 +688,8 @@
     const action=event.target.closest('[data-action]');
     if(!action) return;
     switch(action.dataset.action) {
+      case 'auth-mode': ui.authMode=ui.authMode==='login'?'register':'login'; ui.authMessage=''; ui.authError=false; render(); break;
+      case 'logout': logout(); break;
       case 'start': case 'continue': startLearning(); break;
       case 'complete-lesson': completeLesson(); break;
       case 'reset-challenge': setChallenge(ui.challengeIndex); break;
@@ -607,6 +707,8 @@
     }
   });
   app.addEventListener('submit', event => {
+    const authForm=event.target.closest('[data-auth-form]');
+    if(authForm) { event.preventDefault(); return submitAuthForm(authForm); }
     const form=event.target.closest('[data-profile-form]');
     if(!form) return;
     event.preventDefault();
@@ -619,5 +721,6 @@
     if(bossCard && (event.key==='Enter' || event.key===' ')) { event.preventDefault(); startBoss(); }
   });
 
+  restoreSession();
   render();
 })();
